@@ -1,0 +1,1376 @@
+#!/usr/bin/env python3
+
+from numpy import *
+from scipy import *
+import scipy.interpolate as scpi
+from scipy.integrate import quad
+import imf
+import sys
+import os
+import re
+from astropy import constants as const
+import astropy.units as units
+import numpy as np
+import time
+# was needed only for ZSun; commenting out to reduce dependencies
+#import pycool
+
+profiling = False
+#np.seterr(all='raise')
+
+# low limit on mass fractions to avoid large jumps in mf and subsequent errors in the interpolation
+# all values below mfLowLimit will be reset to it
+mfLowLimit = 1e-20
+
+# Astrophysical constants in CGS {{{
+MSun = const.M_sun.cgs.value  # Solar mass, ~1.9891e+33
+LSun = const.L_sun.cgs.value  # Solar luminosity, ~3.839e+33
+RSun = const.R_sun.cgs.value  # Solar radius, ~69570000000
+#ZSun = pycool.ZSun           # Solar metalicity, ~0.0133 from tracked elements (otherwise 0.016)
+ZSun = 0.013316               #   -> using constant value to make synStars independent on coollib
+c  = const.c.cgs.value        # Speed of light in vacuum, ~2.9979246e+10
+hP = const.h.cgs.value        # Planck constant, 6.62607004e-27
+kB = const.k_B.cgs.value      # Boltzmann constant, ~1.3806503e-16
+mH = const.u.cgs.value        # Atomic mass unit, ~1.6605387e-24
+G  = const.G.cgs.value        # Constant of gravity, ~6.67384e-08
+sigma = const.sigma_sb.cgs.value # Stefan-Boltzmann constant, ~5.670373e-05
+
+# Conversion constants.
+cmpc = const.pc.cgs.value     # Parsec, ~3.0856776e+18
+syr  = (units.yr).to(units.s) # Year, =31556926
+sMyr = syr*1e6                # Megayear in seconds
+# }}}
+
+
+# track-related constants {{{
+TRI_BONN_TIME = 0
+TRI_BONN_MASS = 1
+TRI_BONN_TEFF = 2
+TRI_BONN_LBOL = 3
+TRI_BONN_RAD  = 4
+TRI_BONN_DOTM = 5
+TRI_BONN_SGRV = 6
+TRI_BONN_VSRF = 7
+#TRI_BONN_PROT = 8
+TRI_BONN_VCRT = 8
+TRI_BONN_GAME = 9
+TRI_BONN_EXTR = 10
+TRI_BONN_CRHE = 24
+TRI_BONN_CRCO = 25
+TRI_BONN_SMFB = 26
+TRI_BONN_SMFE = 59
+TR_BONN_TMAX = 1.0e8 # in yr
+
+
+TRI_FRMS_TIME = 1
+TRI_FRMS_LBOL = 2
+TRI_FRMS_TEFF = 3
+TRI_FRMS_MASS = 4
+TRI_FRMS_XHCE = 5
+TRI_FRMS_YHEC = 6
+TRI_FRMS_DMFW = 7
+TRI_FRMS_DMSW = 8
+TRI_FRMS_DOTE = 9
+TRI_FRMS_ZSUR = 10
+TRI_FRMS_SMFB = 11
+TRI_FRMS_SMFE = 20
+TRI_FRMS_LQLW = 21 # flux of Lyman-Werner photons (91.2-110 nm) in photons/s
+TR_FRMS_TMAX = 1.0e8 # in yr
+
+TRI_GENV_TIME = 1
+TRI_GENV_MASS = 2
+TRI_GENV_LBOL = 3
+TRI_GENV_TEFF = 4
+TRI_GENV_SMFB = 5
+TRI_GENV_SMFE = 15
+TRI_GENV_MCCF = 16 # Convective core mass fraction
+# 17 = TEFF again, not corrected for wind thickness
+TRI_GENV_DMFW = 18
+TRI_GENV_RHOC = 19
+TRI_GENV_TEMC = 20
+TRI_GENV_CMFB = 21
+TRI_GENV_CMFE = 31
+TRI_GENV_VCRT = 36
+TRI_GENV_VSRF = 38
+TRI_GENV_GAME = 40
+TRI_GENV_DMSW = 41 # mechanical mass loss at the equator - not used now
+TR_GENV_TMAX = 4.0e8 # in yr
+
+TR_XMWR = 25. # mass limit for WR stars
+
+# }}}
+
+# Constants for derivation of UV photons {{{
+UV_lowT  = 3000              # lowest temperature for the calculaton of UV photons
+UV_upT   = 80000             # highest temperature for the calculaton of UV photons
+UV_step  = 500               # temperature grid step
+UV_thres = 13.60 * 2.418e14  # eV threshold -to Hz- for defining the UV photons
+
+# }}}
+
+# Chemical composition constants {{{
+specNames = array((
+('H1',   'H2',   ''    ) ,
+('He3',  'He4',  ''    ) ,
+('Li6',  'Li7',  ''    ) ,
+('Be7',  'Be9',  ''    ) ,
+('B8',   'B10',  'B11' ) ,
+('C11',  'C12',  'C13' ) ,
+('N12',  'N14',  'N15' ) ,
+('O16',  'O17',  'O18' ) ,
+('F19',  '',     ''    ) ,
+('Ne20', 'Ne21', 'Ne22') ,
+('Na23', '',     ''    ) ,
+('Mg24', 'Mg25', 'Mg26') ,
+('Al26', 'Al27', ''    ) ,
+('Si28', 'Si29', 'Si30') ,
+('P31',  '',     ''    ) ,
+('S32',  'S33',  'S34' ) ,
+('Cl35', 'Cl37', ''    ) ,
+('Ar36', 'Ar38', ''    ) ,
+('K39',  'K40',  'K41' ) ,
+('Ca39', 'Ca40', 'Ca41') ,
+('Sc45', '',     ''    ) ,
+('Ti46', 'Ti47', 'Ti48') ,
+('V50',  'V51',  ''    ) ,
+('Cr50', 'Cr52', 'Cr53') ,
+('Mn55', '',     ''    ) ,
+('Fe55', 'Fe56', 'Fe57') ,
+('Co59', '',     ''    ) ,
+('Ni58', 'Ni60', 'Ni62') ,
+), dtype='S4')
+
+specN = specNames.shape[0]
+specNIsot = specNames.shape[1]
+
+specWeights = array((
+(1,   2.,  0. ) ,
+(3,   4.,  0. ) ,
+(6,   7.,  0. ) ,
+(7,   9.,  0. ) ,
+(8,  10., 11. ) ,
+(11, 12., 13. ) ,
+(12, 14., 15. ) ,
+(16, 17., 18. ) ,
+(19,  0.,  0. ) ,
+(20, 21., 22. ) ,
+(23,  0.,  0. ) ,
+(24, 25., 26. ) ,
+(26, 27.,  0. ) ,
+(28, 29., 30. ) ,
+(31,  0.,  0. ) ,
+(32, 33., 34. ) ,
+(35, 37.,  0. ) ,
+(36, 38.,  0. ) ,
+(39, 40., 41. ) ,
+(39, 40., 41. ) ,
+(45,  0.,  0. ) ,
+(46, 47., 48. ) ,
+(50, 51.,  0. ) ,
+(50, 52., 53. ) ,
+(55,  0.,  0. ) ,
+(55, 56., 57. ) ,
+(59,  0.,  0. ) ,
+(58, 60., 62. ) ,
+), dtype=np.float64)
+
+specBonnInd = array((
+(26, 27, -1) ,     #H
+(28, 29, -1) ,     #He
+(30, 31, -1) ,     #Li
+(32, 33, -1) ,     #Be
+(34, 35, 36) ,     #B
+(37, 38, 39) ,     #C
+(40, 41, 42) ,     #N
+(43, 44, 45) ,     #O
+(46, -1, -1) ,     #F
+(47, 48, 49) ,     #Ne
+(50, -1, -1) ,     #Na
+(51, 52, 53) ,     #Mg
+(54, 55, -1) ,     #Al
+(56, 57, 58) ,     #Si
+(-1, -1, -1) ,     #P
+(-1, -1, -1) ,     #S
+(-1, -1, -1) ,     #Cl
+(-1, -1, -1) ,     #Ar
+(-1, -1, -1) ,     #K
+(-1, -1, -1) ,     #Ca
+(-1, -1, -1) ,     #Sc
+(-1, -1, -1) ,     #Ti
+(-1, -1, -1) ,     #V
+(-1, -1, -1) ,     #Cr
+(-1, -1, -1) ,     #Mn
+(-1, 59, -1) ,     #Fe
+(-1, -1, -1) ,     #Co
+(-1, -1, -1) ,     #Ni
+), dtype=int32)
+
+specFRMSInd = array((
+(11, -1, -1) ,     #H
+(-1, 12, -1) ,     #He
+(-1, -1, -1) ,     #Li
+(-1, -1, -1) ,     #Be
+(-1, -1, -1) ,     #B
+(-1, 13, -1) ,     #C
+(-1, 14, -1) ,     #N
+(15, -1, -1) ,     #O
+(-1, -1, -1) ,     #F
+(-1, -1, -1) ,     #Ne
+(16, -1, -1) ,     #Na
+(17, 18, 19) ,     #Mg
+(-1, 20, -1) ,     #Al
+(-1, -1, -1) ,     #Si
+(-1, -1, -1) ,     #P
+(-1, -1, -1) ,     #S
+(-1, -1, -1) ,     #Cl
+(-1, -1, -1) ,     #Ar
+(-1, -1, -1) ,     #K
+(-1, -1, -1) ,     #Ca
+(-1, -1, -1) ,     #Sc
+(-1, -1, -1) ,     #Ti
+(-1, -1, -1) ,     #V
+(-1, -1, -1) ,     #Cr
+(-1, -1, -1) ,     #Mn
+(-1, -1, -1) ,     #Fe
+(-1, -1, -1) ,     #Co
+(-1, -1, -1) ,     #Ni
+), dtype=int32)
+
+specGenvInd = array((
+( 5, -1, -1) ,     #H
+(-1,  6, -1) ,     #He
+(-1, -1, -1) ,     #Li
+(-1, -1, -1) ,     #Be
+(-1, -1, -1) ,     #B
+(-1,  7,  8) ,     #C
+(-1,  9, -1) ,     #N
+(10, 11, 12) ,     #O
+(-1, -1, -1) ,     #F
+(13, -1, 14) ,     #Ne
+(-1, -1, -1) ,     #Na
+(-1, -1, -1) ,     #Mg
+(15, -1, -1) ,     #Al
+(-1, -1, -1) ,     #Si
+(-1, -1, -1) ,     #P
+(-1, -1, -1) ,     #S
+(-1, -1, -1) ,     #Cl
+(-1, -1, -1) ,     #Ar
+(-1, -1, -1) ,     #K
+(-1, -1, -1) ,     #Ca
+(-1, -1, -1) ,     #Sc
+(-1, -1, -1) ,     #Ti
+(-1, -1, -1) ,     #V
+(-1, -1, -1) ,     #Cr
+(-1, -1, -1) ,     #Mn
+(-1, -1, -1) ,     #Fe
+(-1, -1, -1) ,     #Co
+(-1, -1, -1) ,     #Ni
+), dtype=int32)
+
+# Species for the Schure cooling function
+NSchureSpec = 15
+SchureSpecNames = ('H', 'He', 'C', 'N', 'O', 'Ne', 'Na', 'Mg', 'Al', 'Si', 'S', 'Ar', 'Ca', 'Fe', 'Ni')
+
+# }}}
+
+
+# c_chem class: stores and serves data structure describing chemical composition {{{
+class c_chem:
+    # constructor, creates ab and mf, if Z given, fills these arrays
+    def __init__(self, mf = None, Z = None):
+        if mf is None:
+            self.mf = np.zeros((specN, specNIsot), dtype=np.float64)
+            if Z != None:
+                self.mf = mfSolar.copy()
+                # adjust metallicity... NOT DONE YET
+        else:
+            self.mf = mf.copy()
+        self.ab = np.zeros((specN, specNIsot), dtype=np.float64)
+        self.mf2abund(specWeights)
+
+    # converts mass fractions to abundances
+    def mf2abund(self, weights):
+        #print len(mf_arr), len(weight_arr)
+        sum_mf = (self.mf / (weights + 1e-99)).sum()
+        self.ab = self.mf / (weights*sum_mf + 1e-99)
+        return
+
+    # adds mass fractions from another object
+    def addMF(self, mf, weight):
+        self.mf += mf * weight
+        return
+
+    # normalizes mass fraction so that they add up to 1.0
+    def normMF(self):
+        self.mf /= self.mf.sum() + 1e-99
+        return
+
+    # calculates metallicity from the mf array
+    def calcZ(self):
+        heavy = self.mf[2:,].sum()
+        tot = self.mf.sum()
+        return heavy/tot
+
+    # returns abundances needed by the schure cooling
+    def mf2SchureAb(self):
+        self.mf2abund(specWeights)
+        self.abSchure = np.zeros((15), dtype=np.float64)
+        self.abSchure[0]  = self.ab[0,0]                                    # H
+        self.abSchure[1]  = self.ab[1,0]  + self.ab[1,1]                    # He
+        self.abSchure[2]  = self.ab[5,0]  + self.ab[5,1]                    # C
+        self.abSchure[3]  = self.ab[6,0]  + self.ab[6,1]                    # N
+        self.abSchure[4]  = self.ab[7,0]  + self.ab[7,1] + self.ab[7,2]     # O
+        self.abSchure[5]  = self.ab[9,0]  + self.ab[9,1] + self.ab[9,2]     # Ne
+        self.abSchure[6]  = self.ab[10,0]                                   # Na
+        self.abSchure[7]  = self.ab[11,0] + self.ab[11,1] + self.ab[11,2]   # Mg
+        self.abSchure[7] += self.ab[12,0]                                   # Al26 -> Mg26, because it beta-decays on a short time-scale
+        self.abSchure[8]  = self.ab[12,1]                                   # Al
+        self.abSchure[9]  = self.ab[13,0] + self.ab[13,1] + self.ab[13,2]   # Si
+        self.abSchure[10] = 0.0                                             # S
+        self.abSchure[11] = 0.0                                             # Ar
+        self.abSchure[12] = 0.0                                             # Ca
+        self.abSchure[13] = self.ab[25,1]                                   # Fe
+        self.abSchure[14] = 0.0                                             # Ni
+        return
+# }}}
+
+
+# c_track class: data structures and functions related to a single stellar evolution track {{{
+class c_track(object):
+
+    def __init__(self, m0):
+        self.m0 = m0
+        self.Nt = -1
+        self.time = None
+        self.intQList = ('mask', 'mass_l', 'dotm_l', 'dote_l', 'teff_l', 'rstr_l' \
+        , 'vsrf_l', 'vcrt_l', 'game_l', 'extr', 'crhe_l', 'crco_l')
+        self.iQLisLog = (0,      1,        1,        1,        1,        1        \
+        , 1,        1,        1,        0,      1,        1)
+        self.iQLisOrd = (0,      1,        1,        1,        1,        1        \
+        , 1,        1,        1,        0,      1,        1)
+        # and mass fractions - addition list
+        return
+
+    def genIntrpArrs(self, Nt, specInd):
+        """Create empty arrays to store time evols of quantities."""
+        # {{{
+        self.Nt = Nt
+        self.specInd = specInd
+        self.time = np.zeros((self.Nt), dtype=np.float64)
+        for q in self.intQList:
+            self.__setattr__(q, np.zeros((self.Nt), dtype=np.float64))
+        self.mf_l = np.zeros((self.Nt, specN, specNIsot), dtype=np.float64)
+        return
+        # }}}
+
+
+    def read(self, trdir, filename):
+
+        with open(trdir + '/' + filename, 'r') as f:
+            line = f.readline()
+            spline = line.strip().split()
+            if len(spline) == 23:
+                # FRMS track
+                self.readFRMS(trdir, filename)
+            elif len(spline) == 94:
+                # Bonn track
+                self.readBonn(trdir, filename)
+            elif len(spline) == 43:
+                # Geneva track
+                self.readGeneva(trdir, filename)
+            else:
+                print('Unidentified track file: ', trdir + '/' + filename)
+                print('Number of columns: ', len(spline))
+        return
+
+    # reads basic track quantities from the track file
+    # these quatities are then interpolated and they are:
+    #   time [s], mass_l [MSun], teff_l [K], rstr_l [RSun], dotm_l [MSun/yr], dote_l [erg/s]
+    #   _l means that the quantity is stored (and interpolated) as logarithm
+    def readBonn(self, trdir, filename):
+        self.track = loadtxt(trdir + '/' + filename, dtype=np.float64)
+        # ensure that all tracks start with zero time - not necessary with Bonn tracks
+        #track = vstack([track[0,:], track])
+        #track[0,0] = 0.0
+
+        # add two lines for correct interpolation
+        self.track = vstack([self.track, self.track[-1,:], self.track[-1,:]])
+        self.track[-2,TRI_BONN_MASS] = -1/MSun # star is dead
+        self.track[-2,TRI_BONN_TIME] = self.track[-3,TRI_BONN_TIME]
+        self.track[-1,TRI_BONN_MASS] = -1/MSun # star is dead
+        self.track[-1,TRI_BONN_TIME] = TR_BONN_TMAX
+
+        # read basic quantities: time, mass, teff, rstr, dotm_l; determine mask (1 if star exists)
+        self.time    = self.track[:, TRI_BONN_TIME] * syr
+        self.mass    = self.track[:, TRI_BONN_MASS] * MSun # mass needed to calculate vesc for the wind formula
+        self.extr    = self.track[:, TRI_BONN_EXTR]
+        self.mask    = array((self.mass > 0.0), dtype=np.float64)
+        self.mass_l  = self.mask * log10(self.track[:, TRI_BONN_MASS]).real # negative masses (dead star) lead to complex log10
+        self.teff_l  = self.mask * log10(self.track[:, TRI_BONN_TEFF])
+        self.rstr_l  = self.mask * log10(self.track[:, TRI_BONN_RAD])
+        self.dotm_l  = self.mask * self.track[:, TRI_BONN_DOTM]
+        self.vsrf_l  = self.mask * log10(self.track[:, TRI_BONN_VSRF]+1e-99)
+        self.vcrt_l  = self.mask * log10(self.track[:, TRI_BONN_VCRT]+1e-99)
+        self.game_l  = self.mask * log10(self.track[:, TRI_BONN_GAME])
+        self.crhe_l  = self.mask * log10(self.track[:, TRI_BONN_CRHE])
+        self.crco_l  = self.mask * log10(self.track[:, TRI_BONN_CRCO])
+        # fix invalid -Inf values
+        indInf = where(self.dotm_l < -99)
+        self.dotm_l[indInf] = -99
+
+        # track has a 3D numpy array mf, instead of a list of c_chem objects
+        self.mf    = self.track[:,:][:,specBonnInd] # mf is needed to calculate Z for the wind formula
+        # apply the low limit on mass fractions
+        # it is needed to prevent too large jumps that lead to incorrect results in order>1 interpolations
+        iLowLimit  = where(self.mf < mfLowLimit)
+        self.mf[iLowLimit[0], iLowLimit[1], iLowLimit[2]] = mfLowLimit
+        self.mf_l  = np.log10(self.mf)
+        # set values of unused isotopes to zero to avoid interpolation errors
+        iBonnDel   = where(specBonnInd < 0)
+        self.mf_l[:,iBonnDel[0], iBonnDel[1]] = -99.
+        self.mf[:,iBonnDel[0], iBonnDel[1]] = 0.0
+
+        # wind energy not given in Bonn tracks
+        # it is therefore calculated from a simple model for stellar wind
+        # velocity by Lamers+95 and Vink+01:
+        # v_wind = 2.6 * v_esc if Teff >= 27 kK
+        # v_wind = 1.3 * v_esc if Teff < 27 kK
+        self.teff   = self.mask * self.track[:, TRI_BONN_TEFF] # Teff needed for the wind formula
+        vesc2       = self.mask * 2.0 * G * self.mass / (self.track[:,TRI_BONN_RAD]*RSun+1e-99) + 1e-99
+        windConst   = 1.3*(self.teff >= 27000.) + 1.3
+        Z           = self.mf[:,2:,:].sum(axis=(1,2)) / self.mf[:,:,:].sum(axis=(1,2))
+        vwnd        = windConst * sqrt(vesc2) * (Z/ZSun)**0.13
+        # RSG stars - set to 30 km/s regardless Z or anything
+        #iRSG = where(self.teff_l < 3.9)
+        #vwnd[iRSG] = 30.e5
+        self.dote_l = self.mask * log10(0.5 * (10**self.dotm_l*MSun/syr) * vwnd**2 + 1e-99)
+
+        # number of time-points and ZAMS mass determined from tracks
+        self.Nt     = len(self.time)
+        self.m0     = self.mass[0]
+
+        # set array with indeces to species of Bonn tracks
+        self.specInd = specBonnInd
+
+        return
+
+    def readFRMS(self, trdir, filename):
+        self.track = loadtxt(trdir + '/' + filename, dtype=np.float64)
+        # ensure that all tracks start with zero time - not necessary with Bonn tracks
+        self.track = vstack([self.track[0,:], self.track])
+        self.track[0,TRI_FRMS_TIME] = 0.0
+
+        # add two lines for correct interpolation
+        self.track = vstack([self.track, self.track[-1,:], self.track[-1,:]])
+        self.track[-2,TRI_FRMS_MASS] = -1/MSun # star is dead
+        self.track[-2,TRI_FRMS_TIME] = self.track[-3,TRI_FRMS_TIME]
+        self.track[-1,TRI_FRMS_MASS] = -1/MSun # star is dead
+        self.track[-1,TRI_FRMS_TIME] = TR_FRMS_TMAX
+
+        # read basic quantities: time, mass, teff, rstr, dotm_l; determine mask (1 if star exists)
+        self.time    = self.track[:,TRI_FRMS_TIME] * syr
+        self.mass    = self.track[:,TRI_FRMS_MASS] * MSun # mass needed to calculate vesc for the wind formula
+        self.mask    = array((self.mass > 0.0), dtype=np.float64)
+        self.mass_l  = self.mask * log10(self.track[:, TRI_FRMS_MASS] + 1e-99).real # negative masses (dead star) lead to complex log10
+        self.teff_l  = self.mask * log10(self.track[:, TRI_FRMS_TEFF] + 1e-99)
+        self.dotm_l  = self.mask * log10(self.track[:, TRI_FRMS_DMFW] + self.track[:, TRI_FRMS_DMSW] + 1e-99)
+        self.dote_l  = self.mask * log10(self.track[:, TRI_FRMS_DOTE]*1e35 + 1e-99)
+        self.lbol_l  = self.mask * log10(self.track[:, TRI_FRMS_LBOL] + 1e-99)
+
+        # radius not presebt in tracks => calculate it from Lbol and Teff
+        self.rstr_l  = self.mask * log10(sqrt(10**self.lbol_l*LSun/(4*pi*sigma*(10**self.teff_l)**4))/RSun)
+
+        # track has a 3D numpy array mf, instead of a list of c_chem objects
+        self.mf_l  = log10(self.track[:,:][:,specFRMSInd]+1e-99)
+        self.mf    = self.track[:,:][:,specFRMSInd] # mf is needed to calculate Z for the wind formula
+        # set values of unused isotopes to zero to avoid interpolation errors
+        iFRMSDel   = where(specFRMSInd < 0)
+        self.mf_l[:,iFRMSDel[0], iFRMSDel[1]] = -99.
+        self.mf[:,iFRMSDel[0], iFRMSDel[1]] = 0.0
+
+        # number of time-points and ZAMS mass determined from tracks
+        self.Nt     = len(self.time)
+        self.m0     = self.mass[0]
+
+        # set array with indeces to species of FRMS tracks
+        self.specInd = specFRMSInd
+
+        return
+
+    def readGeneva(self, trdir, filename):
+        self.track = loadtxt(trdir + '/' + filename, dtype=np.float64)
+
+        # ensure that all tracks start with zero time - not necessary with Bonn tracks
+        self.track = vstack([self.track[0,:], self.track])
+        self.track[0,TRI_GENV_TIME] = 0.0
+
+        # add two lines for correct interpolation
+        self.track = vstack([self.track, self.track[-1,:], self.track[-1,:]])
+        self.track[-2,TRI_GENV_MASS] = -1/MSun # star is dead
+        self.track[-2,TRI_GENV_TIME] = self.track[-3,TRI_GENV_TIME]
+        self.track[-1,TRI_GENV_MASS] = -1/MSun # star is dead
+        self.track[-1,TRI_GENV_TIME] = TR_GENV_TMAX
+
+        # read basic quantities: time, mass, teff, rstr, dotm_l; determine mask (1 if star exists)
+        self.time    = self.track[:,TRI_GENV_TIME] * syr
+        self.mass    = self.track[:,TRI_GENV_MASS] * MSun # mass needed to calculate vesc for the wind formula
+
+        self.mask    = array((self.mass > 0.0), dtype=np.float64)
+
+        self.mass_l  = self.mask * log10(self.track[:, TRI_GENV_MASS]).real # negative masses (dead star) lead to complex log10
+        self.teff_l  = self.mask * self.track[:, TRI_GENV_TEFF]
+        self.dotm_l  = self.mask * self.track[:, TRI_GENV_DMFW]
+        self.dotm_l[self.dotm_l == 0] = -99.0 # fix the zero values
+        #self.dote_l  = ... wind power has to be calculated according to one of SB99 recipe
+        self.lbol_l  = self.mask * self.track[:, TRI_GENV_LBOL]
+        self.vsrf_l  = self.mask * log10(self.track[:, TRI_GENV_VSRF]+1e-99)
+        self.vcrt_l  = self.mask * log10(self.track[:, TRI_GENV_VCRT]+1e-99)
+        self.game_l  = self.mask * log10(self.track[:, TRI_GENV_GAME])
+        self.extr    = np.zeros(len(self.track[:,0]),dtype=np.float64)  #Geneva tracks have no extrapolated values
+        self.crhe_l  = np.zeros(len(self.track[:,0]),dtype=np.float64)
+        self.crco_l  = np.zeros(len(self.track[:,0]),dtype=np.float64)
+
+        # radius not presebt in tracks => calculate it from Lbol and Teff
+        self.rstr_l  = self.mask * log10(sqrt(10**self.lbol_l*LSun/(4*pi*sigma*(10**self.teff_l)**4))/RSun)
+
+        # track has a 3D numpy array mf, instead of a list of c_chem objects
+        self.mf    = self.track[:,:][:,specGenvInd] # mf is needed to calculate Z for the wind formula
+        iLowLimit  = where(self.mf < mfLowLimit)
+        self.mf[iLowLimit[0], iLowLimit[1], iLowLimit[2]] = mfLowLimit
+        self.mf_l  = np.log10(self.mf)
+        # set values of unused isotopes to zero to avoid interpolation errors
+        iGenvDel   = where(specGenvInd < 0)
+        self.mf_l[:,iGenvDel[0], iGenvDel[1]] = -99.
+        self.mf[:,iGenvDel[0], iGenvDel[1]] = 0.0
+
+        # number of time-points and ZAMS mass determined from tracks
+        self.Nt     = len(self.time)
+        self.m0     = self.mass[0]
+
+        # calculate the wind power
+        self.detSpectType()
+        self.calcWindPow()
+
+        # set array with indeces to species of Geneva tracks
+        self.specInd = specGenvInd
+
+        return
+
+    def readSB99(self, trdir, filename, tmax):
+        return
+
+    # calculate additional track quantities: lbol, nuv, dotm, dote
+    def calcTrackQuans(self,uvph):
+        self.mass  = self.mask * 10**self.mass_l * MSun
+        self.rstr  = self.mask * 10**self.rstr_l * RSun
+        self.teff  = self.mask * 10**self.teff_l
+        self.dotm  = self.mask * 10**self.dotm_l * MSun/syr
+        self.dote  = self.mask * 10**self.dote_l
+        self.vwnd  = sqrt(2*self.dote/(self.dotm + 1e-99))
+        # possible FloatingPointError (underflow) at the end of tracks due to too low teff
+        self.lbol  = sigma * self.teff**4 * 4*pi*self.rstr**2 # bolometric luminosity from SB law even though tracks include it
+        self.lbol_l = log10(self.lbol/LSun + 1e-99)
+        self.vsrf  = self.mask * 10**self.vsrf_l
+        self.vcrt  = self.mask * 10**self.vcrt_l
+        self.game  = self.mask * 10**self.game_l
+        self.crhe  = self.mask * 10**self.crhe_l
+        self.crco  = self.mask * 10**self.crco_l
+        self.mf   = dstack([self.mask]*specN*specNIsot).reshape((self.Nt,specN, specNIsot)) * 10**self.mf_l
+        iDel = where(self.specInd < 0)
+        self.mf[:,iDel[0], iDel[1]] = 0.0
+
+        self.thom  = 0.2 * (1 + self.mf[:,0,0])
+        self.vterm = 2.6 * sqrt(2 * G * self.mass / (self.rstr + 1e-99))
+        self.rcorr = self.rstr + (3 * self.thom * self.dotm / (8 * pi * self.vterm + 1e-99) )
+        self.tcorr = self.teff * sqrt(self.rstr / (self.rcorr + 1e-99))
+        self.nuv   = 4 * pi * (self.rcorr**2) * [uvph.intrpTemp(t) for t in self.tcorr]
+
+        return
+
+    # interpolates between two time points in the track
+    def intrpTime(self, t):
+        # find the closest time-index and calculate the interpolation constant
+        ind = where(t >= self.time)[0][-1]
+        q = (t - self.time[ind])/(self.time[ind+1] - self.time[ind])
+        #print 'intrpTime: t = ', ind, t, self.time[ind], self.time[ind+1], q, where(t >= self.time)
+
+        # interpolates quantities linearly, including 3D array mf
+        mass = (1.-q) * self.mass[ind] + q * self.mass[ind+1]
+        dotm = (1.-q) * self.dotm[ind] + q * self.dotm[ind+1]
+        dote = (1.-q) * self.dote[ind] + q * self.dote[ind+1]
+        lbol = (1.-q) * self.lbol[ind] + q * self.lbol[ind+1]
+        nuv  = (1.-q) * self.nuv[ind]  + q * self.nuv[ind+1]
+        mf   = (1.-q) * self.mf[ind]   + q * self.mf[ind+1]
+        #print 'intrpTime: ', dotm, q, self.dotm[ind], self.dotm[ind+1]
+        return (mass, dotm, dote, lbol, nuv, mf)
+
+    # determine the spectral type
+    def detSpectType(self):
+
+        # indeces to mass fraction array
+        iH1  = where(specNames == b'H1')
+        mfH1  = self.mf[:,iH1[0], iH1[1]].reshape((self.Nt))
+        iHe4 = where(specNames == b'He4')
+        mfHe4 = self.mf[:,iHe4[0], iHe4[1]].reshape((self.Nt))
+        iC12 = where(specNames == b'C12')
+        mfC12 = self.mf[:,iC12[0], iC12[1]].reshape((self.Nt))
+        iN14 = where(specNames == b'N14')
+        mfN14 = self.mf[:,iN14[0], iN14[1]].reshape((self.Nt))
+        iO16 = where(specNames == b'O16')
+        mfO16 = self.mf[:,iO16[0], iO16[1]].reshape((self.Nt))
+
+        # set spectral type of the star
+        self.styp = ones((self.time.shape[0]), dtype=int32) # 1 = OB stars
+        self.styp[self.teff_l <= 3.9] = 2 # 2 = RSG stars
+        mask = array((self.teff_l < 4.4), dtype=np.float64) \
+        *      array((self.teff_l > 3.75)) * array((self.dotm_l > -3.5))
+        self.styp[mask == 1] = 3 # 3 = LBV star
+        mask = array((self.teff_l > 4.4), dtype=np.float64) \
+        *      array((mfH1 < 0.4)) * (self.mass >= TR_XMWR)
+        self.styp[mask == 1] = 4 # 4 = WR star
+
+        # WR star subtype: Adopted from SB99 v7.0.1
+        # WOLF-RAYET STARS CLASSIFICATION. THIS IS BASED ON SURFACE ABUNDANCES,
+        # ACCORDING TO SMITH AND HUMMER (MNRAS 230,511) AND SMITH AND MAEDER (1991)
+        # FOR WC STARS (C+O/HE RATIO).
+        # FOR WN STARS, THE CLASSIFICATION IS BASED ON CONTI, LEEP
+        # AND PERRY (APJ 268,228). THE DISTINCTION BETWEEN WNL AND WNE IS BASED
+        # ON THE H/HE ABUNDANCE RATIO, AND MANY EXCEPTIONS TO THE RULE ARE KNOWN.
+        # IWR=1--WNL; 2--WNE; 3--WC6-9; 4--WC4-5; 5--WO
+        cnr = mfC12 / (mfN14 + 1e-99)
+        coher = (mfC12/12. + mfO16/16.) / (mfHe4/4. + 1e-99)
+        mask = array((self.styp == 4), dtype=np.float64) * (mfH1 > 0.1 )
+        self.styp[mask == 1] = 14 # 14 = WNL star
+        mask = array((self.styp == 4), dtype=np.float64) * (cnr < 10.)
+        self.styp[mask == 1] = 24 # 24 = WNE star
+        mask = array((self.styp == 4), dtype=np.float64) * (coher < 0.5)
+        self.styp[mask == 1] = 34 # 34 = WC6-9 star
+        mask = array((self.styp == 4), dtype=np.float64) * (coher < 1.0)
+        self.styp[mask == 1] = 44 # 44 = WC4-5 star
+        mask = array((self.styp == 4), dtype=np.float64) * (coher >= 1.0)
+        self.styp[mask == 1] = 54 # 44 = WC4-5 star
+
+        # low mass/luminosity stars have negligible winds
+        mask = array((self.lbol_l < -10.0), dtype=np.float64)
+        self.styp[mask == 1] = 0 # 0 = low luminosity star (with negligible wind)
+
+
+
+    # calculate the wind power (dote)
+    def calcWindPow(self):
+        # currently implements the algorithm MODEL from SB99
+        # described in http://adsabs.harvard.edu/abs/1992ApJ...401..596L
+        self.vwnd = np.zeros((self.time.shape), dtype=np.float64)
+
+        # Wind velocities from SB99 v7.0.1
+        # OBSERVED TERMINAL VELOCITIES. FOUR GROUPS OF STARS ARE CONSIDERED:
+        # 1) FOR NORMAL HOT STARS (LOG TEFF > 3.9) WE USE EQ.(11) OF HOWARTH
+        #    AND PRINJA (1989).
+        # 2) FOR COOL STARS (LOG TEFF < 3.9) WE USE A GENERIC VALUE OF
+        #    30 KM/SEC (DRAKE 1986).
+        # 3) FOR LBV'S (DEFINED VIA: 4.4 > LOG TEFF > 3.75 AND LOG MDOT > -3.5)
+        #    WE USE VINF = 200 KM/SEC.
+        # 4) FOR WR STARS (DEFINED VIA: LOG TEFF > 4.4 AND XSURF < 0.4 AND
+        #    M_INITIAL >= M_WR, WHERE M_WR=MASS LIMIT FOR WR FORMATION) WE
+        #    ADOPT THE AVERAGE VELOCITIES FROM PRINJA, BARLOW AND HOWARTH (1990).
+        #    SUBTYPE CLASSIFICATION IS DONE AS IN THE SPECTYPE SUBROUTINE
+        # ALL TERMINAL VELOCITIES EXCEPT THOSE  OF WR'S ARE SCALED WITH Z**0.13
+        # FOR DIFFERENT METALLICITIES.
+
+        # OB stars
+        gamma0 = 1. - 2.7e-5*10.**self.lbol_l/(self.mass/MSun)
+        gamma0[gamma0<=0] = 1.e-10
+        self.vwnd += 1.e5 * (self.styp == 1) * 618.*sqrt(self.mass/MSun \
+        /            (10.**(0.5*self.lbol_l - 2.*self.teff_l + 7.52))*gamma0).real \
+        *            (0.58 + 2.04*(0.5*self.lbol_l - 2.*self.teff_l + 7.52))
+
+        # RSG stars
+        self.vwnd[self.styp == 2] = 30.e5
+
+        # LBV stars
+        self.vwnd[self.styp == 3] = 200.e5
+
+        # WR stars
+        self.vwnd[self.styp == 14] = 1650.e5
+        self.vwnd[self.styp == 24] = 1900.e5
+        self.vwnd[self.styp == 34] = 1800.e5
+        self.vwnd[self.styp == 44] = 2800.e5
+        self.vwnd[self.styp == 54] = 3500.e5
+
+        # low mass/luminosity stars have negligible winds
+        self.vwnd[self.styp == 0] = 1e-5
+
+        # correction for metallicity
+        z = self.mf[:,2:,:].sum(axis=(1,2)) / ZSun
+        wfac = ones((self.time.shape), dtype=np.float64)
+        z[self.styp > 3] = 1.0 # correction is not applied to WR stars (see SB99)
+        self.vwnd *= z**0.13
+
+        self.dote_l = log10(0.5 * 10**self.dotm_l*MSun/syr * self.vwnd**2)
+        return
+
+# }}}
+
+
+# c_uvphot class: calculates and interpolates number of UV photons as a function of temperature {{{
+class c_uvphot(object):
+    def __init__(self):
+        # Generates a grid of temperatures and calculates the number of UV photons (above UV_thres)
+        self.trange = np.arange(UV_lowT,UV_upT,UV_step)
+        up_nu       = kB*self.trange*sys.float_info.max_10_exp / hP                               # upper integration limit to avoid overflow
+        phot        = lambda nu, t: pi * (2*nu**2) / ((c**2) * (np.exp((hP*nu)/(kB*t)) - 1))      # function of number of photons / Hz / cm^2
+        self.nuv_s  = [quad(phot,UV_thres,up,args=(t,))[0] for up,t in zip(up_nu,self.trange)]    # number of UV photons / cm^2
+        return
+
+    def intrpTemp(self, temp):
+        # find the closest temp-index, calculates the interpolation constant and returns UV photons per surface {{{
+        if (temp > self.trange[0]) and (temp < self.trange[-1]):
+         ind = where(temp >= self.trange)[0][-1]
+         q = (temp - self.trange[ind])/(self.trange[ind+1] - self.trange[ind])
+         uv_phot = (1.-q) * self.nuv_s[ind] + q * self.nuv_s[ind+1]
+        elif (temp > self.trange[-1]):
+         uv_phot = self.nuv_s[-1]     							          # keep the highest UV_phot value for teff > UV_upT
+        else:
+         uv_phot = 0.0
+        return uv_phot
+        # }}}
+# }}}
+
+
+# c_trackGrid class: controls a set of tracks, interpolats between them, sums over IMF etc. {{{
+class c_trackGrid(object):
+    def __init__(self, opts):
+        # {{{
+        self.trDir = opts.trdir
+        self.trFile = opts.trfile
+        self.intType_tM0 = opts.intType_tM0
+        if (self.intType_tM0 != 'lin') and (self.intType_tM0 != 'log'):
+            print('Interpolation type (intType_tM0) must be either "lin" or "log".')
+            sys.exit()
+        self.iord_tM0 = opts.iord_tM0
+        self.iord_QM0 = opts.iord_QM0
+        self.imffile = opts.imffile
+        self.mbinFirstValid = None # first valid (=interpolated) track
+        self.mbinLastValid  = None # last valid (=interpolated) track
+        self.uvph = c_uvphot()
+        return
+        # }}}
+
+    def readTracks(self):
+        # find track files in the trdir directory {{{
+        t0 = time.perf_counter()
+        self.trackFiles = []
+        for f in os.listdir(self.trDir):
+            if re.match(self.trFile, f): self.trackFiles.append(f)
+        self.Ntracks = len(self.trackFiles)
+        #print '# Found %d tracks: ' % (self.Ntracks), self.trackFiles
+
+        # read tracks and store them in the 'tracks' list
+        self.tracks = []
+        for tf in self.trackFiles:
+            tr = c_track(-1.0)
+            tr.read(self.trDir, tf)
+            tr.calcTrackQuans(self.uvph)
+            self.tracks.append(tr)
+
+        # sort tracks according to ZAMS mass
+        self.tracks.sort(key = lambda t: t.m0)
+
+        # check that all tracks have the same number of time points
+        self.Nt = self.tracks[0].Nt # get number of time-points from the 1st track
+        for itr in range(self.Ntracks):
+            if self.tracks[itr].Nt != self.Nt:
+                print('Different number of time points in tracks: ', \
+                self.Nt, self.tracks[itr].Nt, self.tracks[itr].m0 / MSun, 'MSun')
+                sys.exit()
+
+        t1 = time.perf_counter()
+        if profiling:
+            print('## c_trackGrid.readTracks: reading tracks = ', t1-t0)
+        return
+        # }}}
+
+    def createGrid(self, mbin):
+        # creates denser grid of stellar ev. tracks by interpolating between them
+        # works only if all tracks have the same indeces at times of the "same"
+        # evolutionary stage
+        # {{{
+        t0 = time.perf_counter()
+
+        # create grid of tracks for interpolation and
+        # generates mmidValid, and mmidValid_l arrays
+        self.createEmptyGrid(mbin)
+        for i in range(len(mbin)-1):
+            mmid = 0.5*(mbin[i] + mbin[i+1])
+
+        # generate empty arrays for interpolated quantities
+        # for "valid" tracks only, i.e. the ones lying between provided tracks
+        for im in range(self.mbinFirstValid, self.mbinLastValid):
+            self.grid[im].genIntrpArrs(self.Nt, self.tracks[0].specInd)
+        t1 = time.perf_counter()
+        if profiling:
+            print('## c_trackGrid.createGrid: grid generation time = ', t1-t0)
+
+        # generate control points of the interpolation (data from provided tracks)
+        self.genControlPoints()
+        t2 = time.perf_counter()
+        if profiling:
+            print('## c_trackGrid.createGrid: control point generation time = ', t2-t1)
+
+        # interpolate quantities (including time) as functions of M0 (ZAMS mass)
+        self.intrpQuantOfM0()
+        t3 = time.perf_counter()
+        if profiling:
+            print('## c_trackGrid.createGrid: total interpolation time = ', t3-t2)
+
+        # deallocate the cp_ arrays as they occupy a lot of memory
+        self.freeControlPoints()
+
+        # call several postprocessing methods
+        for im in range(self.mbinFirstValid, self.mbinLastValid):
+            self.grid[im].calcTrackQuans(self.uvph)
+        t4 = time.perf_counter()
+        for im in range(self.mbinFirstValid, self.mbinLastValid):
+            self.grid[im].detSpectType()
+        t5 = time.perf_counter()
+        if profiling:
+            print('## c_trackGrid.createGrid: CalcTrackQuans time = ', t4-t3)
+            print('## c_trackGrid.createGrid: Detect spectral type time = ', t5-t4)
+
+        return
+        # }}}
+
+    def createEmptyGrid(self, mbin):
+        # create grid of empty tracks covering the whole range of IMF
+        # set indeces mbinFirstValid and mbinLastValid and generate arrays of valid masses
+        # {{{
+        self.grid = []
+        mmidValidList = [] # list of tracks with valid ZAMS
+        for i in range(len(mbin)-1):
+            # create c_track object, assign ZAMS mass
+            mmid = 0.5*(mbin[i] + mbin[i+1])
+            tr = c_track(mmid)
+
+            # set beginning and end of valid tracks on the mbin grid
+            if (not self.mbinFirstValid) and (mmid >= self.tracks[0].m0):
+                self.mbinFirstValid = i
+            if (not self.mbinLastValid)  and (mmid > self.tracks[-1].m0):
+                self.mbinLastValid = i
+            # set this track to be valid (i.e. interpolated) and add its ZAMS mass to mbinValid list
+            if self.mbinFirstValid and (not self.mbinLastValid):
+                mmidValidList.append(mmid)
+
+            # add the track to the grid
+            self.grid.append(tr)
+
+        # set mbinLastValid
+        if not self.mbinLastValid:
+            self.mbinLastValid = len(mbin)-1
+
+        # create list of valid ZAMS mass points - those that will be interpolated
+        self.mmidValid = array(mmidValidList, dtype=np.float64)
+        self.mmidValid_l = log10(self.mmidValid)
+
+        #print 'createEmptyGrid: ', len(self.grid), self.mbinFirstValid, self.mbinLastValid
+        #print 'mmidValid: ', self.mmidValid, self.mmidValid_l
+
+        return
+        # }}}
+
+    def genControlPoints(self):
+        # {{{
+        tr0 = self.tracks[0]
+        # create empty arrays for control points, provided tracks at the last index (closest in memory)
+        # ZAMS mass and its logarithm
+        self.cp_m0   = np.zeros((self.Ntracks), dtype=np.float64)
+        self.cp_m0_l = np.zeros((self.Ntracks), dtype=np.float64)
+        # time on the provided tracks
+        self.cp_time = np.zeros((self.Nt, self.Ntracks), dtype=np.float64)
+        # other track quantities: mask, mass_l, dotm_l, dote_l, teff_l, rstr_l, ...
+        for q in tr0.intQList:
+            setattr(self, 'cp_'+q, np.zeros((self.Nt, self.Ntracks), dtype=np.float64))
+        # mass fractions: specN = number of species, specNIsot = max numer of isotopes of each specie (currently 3)
+        self.cp_mf_l = np.zeros((self.Nt, specN, specNIsot, self.Ntracks), dtype=np.float64)
+
+        # insert the track data into the control points
+        for itr in range(self.Ntracks):
+            # ZAMS mass
+            self.cp_m0[itr]     = self.tracks[itr].m0
+            # time
+            self.cp_time[:,itr] = self.tracks[itr].time
+            # other track quantities: mask, mass_l, dotm_l, dote_l, teff_l, rstr_l, ...
+            for q in tr0.intQList:
+                cpq = getattr(self, 'cp_'+q)
+                cpq[:,itr] = getattr(self.tracks[itr], q)
+            # mass fractions
+            self.cp_mf_l[:,:,:,itr] = self.tracks[itr].mf_l[:,:,:]
+
+        # sort out linear vs. logarithimic scaling
+        # define special array for log ZAMS mass
+        self.cp_m0_l = np.log10(self.cp_m0)
+        # convert cp_time to log if intType_tM0 is set
+        if self.intType_tM0 == 'log':
+            np.log10(self.cp_time+1e-99, out=self.cp_time)
+        # convert other quantities:
+        #  - if quantity is not logarithmic, convert it to linear
+        for iq in range(len(tr0.intQList)):
+            q = tr0.intQList[iq]
+            if (tr0.iQLisLog[iq] == 0):
+                cpq = getattr(self, 'cp_'+q)
+                np.log10(cpq+1e-99, out=cpq)
+            #print 'Control point quantity: ', q
+            #print 'cpq = ', getattr(self, 'cp_'+q)[0,:].tolist()
+
+        # convert mass fractions:
+        # nothing to be done here as mf_l is already in log scale
+
+        return
+        # }}}
+
+    def freeControlPoints(self):
+        """Deallocate cp_ arrays to save memory."""
+        # {{{
+        self.cp_m0   = None
+        self.cp_m0_l = None
+        self.cp_time = None
+        for q in self.tracks[0].intQList:
+            setattr(self, 'cp_'+q, None)
+        self.cp_mf_l = None
+        return
+        # }}}
+
+    def intrpQuantOfM0(self):
+        # {{{
+
+        tr0 = self.tracks[0]
+
+        # create ip_arrays to store interpolated values; local variabels that will die at return
+        t0 = time.perf_counter()
+        ip_time = np.zeros((self.Nt, len(self.mmidValid)), dtype=np.float64)
+        for q in self.tracks[0].intQList:
+            setattr(self, 'ip_'+q, np.zeros((self.Nt, len(self.mmidValid)), dtype=np.float64))
+        ip_mf_l = np.zeros((self.Nt, specN, specNIsot, len(self.mmidValid)), dtype=np.float64)
+        t1 = time.perf_counter()
+
+        # interpolate
+        for itime in range(self.Nt):
+            # time
+            if self.intType_tM0 == 'log':
+                spline = scpi.InterpolatedUnivariateSpline(self.cp_m0_l, self.cp_time[itime,:], k=self.iord_tM0)
+                ip_time[itime,:] = spline(self.mmidValid_l)
+            else:
+                spline = scpi.InterpolatedUnivariateSpline(self.cp_m0,   self.cp_time[itime,:], k=self.iord_tM0)
+                ip_time[itime,:] = spline(self.mmidValid)
+            # other track quantities: mask, mass_l, dotm_l, dote_l, teff_l, rstr_l, ...
+            for q in self.tracks[0].intQList:
+                cpq = getattr(self, 'cp_' + q)
+                ipq = getattr(self, 'ip_' + q)
+                spline = scpi.InterpolatedUnivariateSpline(self.cp_m0_l, cpq[itime,:], k=self.iord_QM0)
+                ipq[itime,:] = spline(self.mmidValid_l)
+            # mass fractions
+            for ispec in range(specN):
+                for iisot in range(specNIsot):
+                    if tr0.specInd[ispec,iisot] > 0:
+                        spline = scpi.InterpolatedUnivariateSpline(self.cp_m0_l, self.cp_mf_l[itime,ispec,iisot,:], k=self.iord_QM0)
+                        ip_mf_l[itime,ispec,iisot,:] = spline(self.mmidValid_l)
+        t2 = time.perf_counter()
+        if profiling:
+            print('  ## c_trackGrid.intrpQuantOfM0: Actual interpolation time: ', t2-t0)
+
+        # copy data from ip_ arrays to the grid data structure and
+        # convert non-log quantities back to their linear scale
+        for im in range(len(self.mmidValid)):
+            if self.intType_tM0 == 'log':
+                self.grid[im+self.mbinFirstValid].time[:] = np.power(10, ip_time[:,im])
+            else:
+                self.grid[im+self.mbinFirstValid].time[:] = ip_time[:,im]
+            self.grid[im+self.mbinFirstValid].time[0] = 0.0
+
+            for iq in range(len(tr0.intQList)):
+                q = tr0.intQList[iq]
+                ipq = getattr(self, 'ip_' + q)
+                grq = getattr(self.grid[im+self.mbinFirstValid], q)
+                grq[:] = ipq[:,im]
+
+                if (tr0.iQLisLog[iq] == 0):
+                    np.power(10, grq, out=grq)
+
+            self.grid[im+self.mbinFirstValid].mf_l[:,:,:] = ip_mf_l[:,:,:,im]
+
+        t3 = time.perf_counter()
+        if profiling:
+            print('  ## c_trackGrid.intrpQuantOfM0: lin/log conversion time: ', t3-t2)
+
+        return
+        # }}}
+
+    # print grid into file
+    def saveTrackGrid(self, filename):
+        t0 = time.perf_counter()
+        nmbin_used = array(list(map(lambda g: g.Nt > 0, self.grid)), dtype=int32).sum()
+        print('# track directory: ', self.trDir)
+        print('# track files: ', self.trackFiles)
+        print('# number of mass bins interpolated: ', nmbin_used)
+        if filename == '': return
+        with open(filename, 'w') as f:
+            f.write('#   mZAMS       time(02)      mass(03)      dotM(04)      vwnd(05)      dotE(06)      Lbol(07)' \
+            +   '      Rstar(08)     Teff(09)      mask(10)      sptType(11)   vsrf(12)      vcrt(13)      GamE(15)' \
+            +   '      extrpol(16)   crHe(17)      crCO(18)      ')
+#        +      '   sMF_H1(12)    sMF_He4(13)   sMF_C12(14)   sMF_N14(15)   sMF_O16(16)   sMF_Na23(17)\n')
+            # ival = first valid track
+            for i in range(len(self.grid)-1):
+                if self.grid[i].Nt > 0:
+                    ival = 1
+                    break
+            # create and write the header string with mass fractions
+            mfStr = ''
+            ind = 17
+            for imf in range(len(specNames)):
+                for iz in range(3):
+                    if self.grid[self.mbinFirstValid].specInd[imf,iz] > 0:
+                        mfStr += 'sMF_{:4}({:02})  '.format(specNames[imf,iz].decode(), ind)
+                        ind += 1
+            f.write('{}\n'.format(mfStr))
+
+            for i in range(len(self.grid)-1):
+                if self.grid[i].Nt > 0:
+                    f.write('# m = % g MSun = % 12.5e g\n' % (self.grid[i].m0/MSun, self.grid[i].m0))
+                    for k in range(self.grid[i].Nt):
+                        f.write(('% 13.5e % 13.5e % 13.5e % 13.5e % 13.5e % 13.5e % 13.5e ' \
+                        +        '% 13.5e % 13.5e % 13.5e % 13.5e % 13.5e % 13.5e % 13.5e ' \
+                        +        '% 13.5e % 13.5e % 13.5e ')
+                        #+        '% 13.5e % 13.5e % 13.5e % 13.5e % 13.5e % 13.5e\n') \
+                        % (self.grid[i].m0, self.grid[i].time[k], self.grid[i].mass[k], self.grid[i].dotm[k] \
+                        , self.grid[i].vwnd[k], self.grid[i].dote[k], self.grid[i].lbol[k] \
+                        , self.grid[i].rstr[k], self.grid[i].teff[k], self.grid[i].mask[k], self.grid[i].styp[k] \
+                        , self.grid[i].vsrf[k], self.grid[i].vcrt[k], self.grid[i].game[k], self.grid[i].extr[k] > 1.01e-99 \
+                        , self.grid[i].crhe[k], self.grid[i].crco[k]))
+                        for imf in range(len(specNames)):
+                            for iz in range(3):
+                                if self.grid[self.mbinFirstValid].specInd[imf,iz] > 0:
+                                    f.write('{: 13.5e} '.format(self.grid[i].mf[k,imf,iz]))
+                        f.write('\n')
+
+                        #, self.grid[i].mf[k,0,0], self.grid[i].mf[k,1,1], self.grid[i].mf[k,5,0] \
+                        #, self.grid[i].mf[k,6,0], self.grid[i].mf[k,7,0], self.grid[i].mf[k,10,0]))
+
+                    f.write('\n\n')
+        t1 = time.perf_counter()
+        if profiling:
+            print('  ## c_trackGrid.saveTrackGrid: creating track_grid file time: ', t1-t0)
+
+        return
+
+
+    # sums all tracks in the grid weighted by IMF representation
+    def sumOverIMF(self, it, time, nstars):
+        # reset accumulators to np.zeros
+        binMass = np.zeros((len(nstars)), dtype=np.float64)
+        binDotM = np.zeros((len(nstars)), dtype=np.float64)
+        binDotE = np.zeros((len(nstars)), dtype=np.float64)
+        binLbol = np.zeros((len(nstars)), dtype=np.float64)
+        binNUV  = np.zeros((len(nstars)), dtype=np.float64)
+        totChem = c_chem() # create c_chem object
+
+        # loop over all mass bins
+        for j in range(len(nstars)):
+            # skip masses without acyual tracks
+            if self.grid[j].time is None: continue
+
+            # interpolate in the j-th track for a proper time
+            (mass, dotm, dote, lbol, nuv, mf) = self.grid[j].intrpTime(time)
+            binMass[j] = mass*nstars[j]
+            binDotM[j] = dotm*nstars[j]
+            binDotE[j] = dote*nstars[j]
+            binLbol[j] = lbol*nstars[j]
+            binNUV[j]  = nuv *nstars[j]
+
+            # add quantities from different mass bins
+            #dmwind = nstars[j] * dotm
+            #totMass += nstars[j] * mass
+            #totDotM += dmwind
+            #totDotE += nstars[j] * dote
+            #totLbol += nstars[j] * lbol
+            #totNUV  += nstars[j] * nuv
+
+            # accumulate mass fractions weighted by dwind in the totChem object
+            totChem.addMF(mf, nstars[j]*dotm)
+
+
+        # sum up contributions of all bins
+        (totMass, totDotM, totDotE, totLbol, totNUV) \
+        = (binMass.sum(), binDotM.sum(), binDotE.sum(), binLbol.sum(), binNUV.sum())
+
+        # normalize mass fractions in the totChem object
+        totChem.normMF()
+        totChem.mf2abund(specWeights)
+        totChem.mf2SchureAb()
+
+        # eventually write imf bin info into imf file
+        if self.imffile != '':
+            self.writeIMFFile(it, time, nstars, binMass, binDotM, binDotE, binLbol, binNUV)
+
+        return (totDotM, totDotE, totLbol, totNUV, totChem)
+
+    def writeIMFFile(self, it, time, nstars, binMass, binDotM, binDotE, binLbol, binNUV):
+        cumDotM   = cumsum(binDotM[::-1])[::-1]
+        cumDotE   = cumsum(binDotE[::-1])[::-1]
+        cumNstars = cumsum((nstars*(binMass>0.0))[::-1])[::-1]
+        with open('%s-%04d' % (self.imffile, it), 'w') as f:
+            f.write('# time = % 15.7e nstars = %.1e\n' % (time, nstars.sum()))
+            f.write(('# Ibin Mbin          nstars        mass          dotM          dotE          vinf' \
+            +     '          Lbol          NUV           cumDotM       cumDotE       cumNstar\n'))
+            for i in range(len(nstars)):
+                f.write('%4d % 13.5e % 13.5e % 13.5e % 13.5e % 13.5e % 13.5e % 13.5e % 13.5e % 13.5e % 13.5e %13.0f\n' \
+                % (i, self.grid[i].m0, nstars[i], binMass[i], binDotM[i], binDotE[i] \
+                , sqrt(2*binDotE[i]/binDotM[i]), binLbol[i], binNUV[i] \
+                , cumDotM[i]/binDotM.sum(), cumDotE[i]/binDotE.sum() \
+                , cumNstars[i]))
+
+
+# }}}
+
+
+# c_cluster class: stores params of the cluster, controls calculation of whole-cluster-related quantities {{{
+class c_cluster:
+    # 1D: time, dotmfw, dotmsw, vwind, lbol, dote, Nuv
+    # 3D: surfMF(t,Z,isot)
+    # 2D: abSchure
+
+    # constructor: fill basic cluster params from cml args; create and fill mass bins according to IMF
+    def __init__(self, opts):
+        self.Nmbin = opts.Nmbin
+        self.Nt    = opts.Nt
+        self.tmax  = opts.tmax * sMyr
+        self.mtot  = opts.mtot
+        self.imftype = opts.imftype
+        (self.imfbin, self.alpha) = imf.parse_imfarg(opts.imfbin, opts.alpha, opts.imftype)
+        self.ret1  = opts.ret1
+        self.intType_tM0  = opts.intType_tM0
+        self.iord_tM0  = opts.iord_tM0
+        self.iord_QM0  = opts.iord_QM0
+
+        self.createMassBins()
+        self.calcStarNumbers()
+        return
+
+    # create bins of traced stellar masses
+    def createMassBins(self):
+        (mbin_max, mbin_min) = (self.imfbin[-1], self.imfbin[0])
+        self.mbin = np.zeros((self.Nmbin+1), dtype=np.float64)
+        dm = (mbin_max / mbin_min)**(1.0/(self.Nmbin))
+        self.mbin[0] = mbin_min
+        for i in range(1,self.Nmbin+1): self.mbin[i] = self.mbin[i-1] * dm
+        self.mbin *= MSun
+        return
+
+    # normalizes IMF and determine number of stars in each mbin
+    def calcStarNumbers(self):
+        if self.imftype == 'maschberger':
+            IMF = imf.c_imf_maschberger(self.imfbin, self.alpha)
+        else:
+            IMF = imf.c_imf_ppl(self.imfbin, self.alpha)
+        IMF.norm_mass(self.mtot)
+        self.nstars = np.zeros((self.Nmbin), dtype=np.float64)
+        for j in range(self.Nmbin):
+            self.nstars[j] = IMF.int_imf(self.mbin[j]/MSun, self.mbin[j+1]/MSun)
+        return
+
+    # calculate cluster wind parameters by population synthesis for all time-points
+    def fillTimeSeries(self, trackGrid):
+        t0 = time.perf_counter()
+        self.dotm = np.zeros((self.Nt), dtype=np.float64)
+        self.dote = np.zeros((self.Nt), dtype=np.float64)
+        self.lbol = np.zeros((self.Nt), dtype=np.float64)
+        self.nuv  = np.zeros((self.Nt), dtype=np.float64)
+        self.chem = []
+
+        for i in range(self.Nt):
+            t = self.tmax*i/self.Nt
+
+            # integrate over IMF
+            (self.dotm[i], self.dote[i], self.lbol[i], self.nuv[i], chem) = trackGrid.sumOverIMF(i, t, self.nstars)
+            self.chem.append(chem)
+
+        t1 = time.perf_counter()
+        if profiling:
+            print('## c_cluster.fillTimeSeries: calling trackGrid.sumOverIMF for each time: ', t1-t0)
+        return
+
+    # integrate over time series to get total amount of inserted mass and energy
+    def timeIntegrate(self):
+        t0 = time.perf_counter()
+        self.Macc = np.zeros((self.Nt, ), dtype=np.float64)
+        self.Eacc = np.zeros((self.Nt, ), dtype=np.float64)
+        dt = self.tmax/self.Nt
+        for i in range(1,self.Nt):
+            self.Macc[i] = self.Macc[i-1] + dt*self.dotm[i]
+            self.Eacc[i] = self.Eacc[i-1] + dt*self.dote[i]
+        t1 = time.perf_counter()
+        if profiling:
+            print('## c_cluster.timeIntegrate: integration time: ', t1-t0)
+        return
+
+    # prints header
+    def printHdr(self):
+        print('# Nmbin       = ', self.Nmbin)
+        print('# Nt          = ', self.Nt)
+        print('# tmax        = ', self.tmax/sMyr, 'Myr')
+        print('# imfbin      = ', self.imfbin)
+        print('# imftype     = ', self.imftype)
+        print('# alpha       = ', self.alpha)
+        print('# ret1        = ', self.ret1)
+        print('# mtot        = ', self.mtot)
+        print('# intType_tM0 = ', self.intType_tM0)
+        print('# iord_tM0    = ', self.iord_tM0)
+        print('# iord_QM0    = ', self.iord_QM0)
+        sys.stdout.write('# t(001)        dMfw(002)     dMsw(003)     dEfw(004)     Lbol(005)     nUV(006)      Min(007)      Ein(008)       ')
+
+        j = 9
+        line = ''
+        for i in range(NSchureSpec):
+            # Schure cooling species
+            line += 'ab%-2s(%03d)     ' % (SchureSpecNames[i], j)
+            j += 1
+        ind = where(specNames != b'')
+        for i in range(len(ind[0])):
+            # mass fractions from tracks
+            line += 'mf{:<4}({:03d})   '.format(str(specNames[ind[0][i],ind[1][i]], 'utf-8'), j)
+            j += 1
+        #for i in range(len(ind[0])):
+        #    # accumulated mass of species from from tracks
+        #    line += 'Macc%-4s(%03d) ' % (specNames[ind[0][i],ind[1][i]], j)
+        #    j += 1
+
+        print(line)
+        return
+
+    # def print_line(dotm, dote, abund, lbol, nuv, abund, MF, MFacc)
+    def printLine(self, it):
+        sys.stdout.write('% 13.5e % 13.5e % 13.5e % 13.5e % 13.5e % 13.5e % 13.5e % 13.5e ' \
+        % (self.tmax*it/self.Nt, self.dotm[it], 0, self.dote[it], self.lbol[it], self.nuv[it], self.Macc[it], self.Eacc[it]))
+        line = ' '
+        for i in range(NSchureSpec):
+            # Schure cooling species
+            line += '% 13.5e ' % (self.chem[it].abSchure[i])
+        ind = where(specNames != b'')
+        for i in range(len(ind[0])):
+            # mass fractions from tracks
+            line += '% 13.5e ' % (self.chem[it].mf[ind[0][i],ind[1][i]])
+        #for i in range(NtrSpec):
+        #    # accumulated mass of species from from tracks
+        #    line += '% 12.5e ' % (MFacc[i])
+
+        print(line)
+        return
+
+    def printEvol(self):
+        self.printHdr()
+        for i in range(self.Nt):
+            self.printLine(i)
+
+# }}}
+
+def queryDatabase(opts):
+# {{{
+    if opts.mtot and (opts.dbname != ""):
+        print('# Only one of "--mtot" and "--dbname" can be given, not both.')
+        sys.exit()
+
+    # check whether   of the cluster was given
+    if not opts.mtot and (opts.dbname == ""):
+        print('Unknown cluster mass. Give either --mtot or --dbname.')
+        sys.exit()
+
+    if (opts.dbname == ""): return
+
+    # GC name given, obtain the cluster mass from database
+    import clDatabase
+    conn = clDatabase.dbConnect(opts.dbuser, opts.dbpass)
+    if not conn: sys.exit()
+    mass = clDatabase.dbGetMGC(conn, opts.dbname)
+    if not mass:
+        clDatabase.dbDisconnect(conn)
+        sys.exit()
+        return
+
+    # mass of the cluster successfully retrieved from database
+    print('# Cluster name: ', opts.dbname)
+    print('# M_now   = {:10.1f} MSun (current cluster mass from database)'.format(mass))
+
+    # convert mass of the GC into the 1G mass of the progenitor
+    N1Ntot = clDatabase.dbGetN1Ntot(conn, opts.dbname)
+    if not N1Ntot:
+        clDatabase.dbDisconnect(conn)
+        sys.exit()
+        return
+
+    #retrive retention fraction from the database if ret1 negative
+    ret1 = opts.ret1
+    if opts.ret1 < 0.0:
+        ret1 = clDatabase.dbGetRet(conn, opts.dbname)
+        if not ret1:
+            clDatabase.dbDisconnect(conn)
+            sys.exit()
+            return
+
+    # database not needed anymore => disconnect
+    clDatabase.dbDisconnect(conn)
+
+    # population ratio successfully retrieved from database
+    print('# N1/Ntot = {:10.8f}      (current population ratio of the cluster stars from database)'.format(N1Ntot))
+    print('# M1G_now = {:10.1f} MSun (current 1G mass)'.format(mass*N1Ntot))
+
+    (imfbin, alpha) = imf.parse_imfarg(opts.imfbin, opts.alpha, opts.imftype)
+    if opts.imftype == 'maschberger':
+        imf1G = imf.c_imf_maschberger(imfbin, alpha)
+    else:
+        imf1G = imf.c_imf_ppl(imfbin, alpha)
+
+    import clEvolution
+    M1G = clEvolution.MnowToM0(mass*N1Ntot, ret1, imf1G)
+    print('# Msc     = {:10.1f} MSun ((total mass of the young cluster, includes 1G only, -> mtot)'.format(M1G))
+
+    opts.mtot = M1G
+    opts.ret1 = ret1
+    return
+# }}}
+
+
+####################################################################################
+################################ MAIN PROGRAM ######################################
+####################################################################################
+
+# import cml arguments
+import synsParser
+import argparse
+parser = argparse.ArgumentParser(
+description="Simple stellar evolution synthesis code.",
+parents = [synsParser.getParser()])
+opts = parser.parse_args(sys.argv[1:])
+
+# eventually retrieve the cluster mass
+# from the database (table BaumgardtHilker18)
+queryDatabase(opts)
+
+# create cluster and trackGrid objects
+cluster = c_cluster(opts)
+trackGrid = c_trackGrid(opts)
+
+# read stellar evolution tracks from files
+trackGrid.readTracks()
+
+# create finer grid of tracks, with masses given in cluster.mbin array
+trackGrid.createGrid(cluster.mbin)
+
+# optionally save the trackGrid into a file
+trackGrid.saveTrackGrid(opts.gridfile)
+
+# calculate cluster wind properties for each time-point
+cluster.fillTimeSeries(trackGrid)
+
+# time-integrate to get total mass and energy
+cluster.timeIntegrate()
+
+# print results to stdout
+cluster.printEvol()

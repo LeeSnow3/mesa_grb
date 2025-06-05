@@ -1,0 +1,37 @@
+#####################################
+
+This is the 'Bonn' Optimized Stellar Tracks (BoOST) version v1_3
+
+Please direct comments and questions to Dorottya Szécsi (dorottya.szecsi at gmail.com)
+
+#####################################
+
+#####################################
+
+This version contains:
+
+(a) stellar model grids
+
+(b) interpolated stellar tracks
+
+(c) synthetic populations
+
+Additionally, we provide
+
+– our phython code 'synStars'; i.e. the version that was used to create the data in (b) and (c)
+
+– some useful analytic figures 
+
+Webpage: http://boost.asu.cas.cz/
+
+Changes from previous versions are listed on our webpage.
+
+Please cite the following paper when applying any of our data: https://ui.adsabs.harvard.edu/abs/2020arXiv200408203S/abstract
+
+
+
+
+
+
+
+
