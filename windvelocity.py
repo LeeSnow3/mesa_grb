@@ -2,9 +2,11 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy
+from scipy.interpolate import interp1d
+
 #read file in 
 
-filename = "f150-500.izw18.dat"
+filename = "BoOST Data files//f020-500.izw18.dat"
 
 
 data = np.genfromtxt(filename, autostrip=True)
@@ -48,7 +50,6 @@ class StellarModel:
             self.C_massfrac = data[:, 37] + data[:, 38] + data[:, 39]
             self.O_massfrac = data[:, 43] + data[:, 44] + data[:, 45]
 
-
 vars = StellarModel(data, filename)
 
 def compute_vwind_vink(mass, radius, Gamma, temp):
@@ -88,7 +89,7 @@ def compute_vwind_vink(mass, radius, Gamma, temp):
 
 def compute_vwind_nugis(mass, radius, gamma, luminosity, He_massfrac, C_massfrac, O_massfrac):
     '''
-    ***DOESN'T REALLY WORK***
+    ***DOESN'T REALLY WORK, RETURNS UNREALISTICALLY LOW VALUES***
     
     Compute v_wind using Nugis & Lamers (2000) prescription for WR stars.
 
@@ -195,60 +196,6 @@ def metal_plotting(time_myr, H_massfrac, He_massfrac, metallicity, initialmass):
     plt.title(f"Initial Mass: {initialmass} Solar Masses")
     plt.savefig(f"Metallicity plots/{initialmass}.png")
 
-def wind_density_profile(time, radius, v_wind, mdot):
-    """
-    Compute how far v_wind has traveled over the lifetime of the star 
-
-    Parameters:
-    - time: array of time in years
-    - radius: array of stellar radii in solar radii
-    - v_wind: array of wind velocities in solar radii/year
-
-    Returns:
-    - wind_radius: array of radii corresponding to how far wind from each time step has travelled from the center of the star
-    """
-
-    #Constants
-    sec_per_year = 3.154e7       # s 
-    M_sun = 1.98847e33           # g
-    R_sun = 6.957e10             # cm
-
-    # Convert to CGS
-    t_sec = time * sec_per_year
-    mdot = 10**mdot * M_sun / sec_per_year 
-    R_cgs = radius * R_sun
-    
-    end_time = t_sec[-1]
-
-    density = []
-    for ind in range(0, len(time)-1):
-        #calculates how far the wind from each time step has travelled over the course of the stars life
-        wind_radius = v_wind * (end_time - t_sec[ind]) + R_cgs[ind]
-        #Mass ejected in each interval
-        dt = time - t_sec[ind+1]
-        dm = mdot * dt  # [g]
-        
-
-    #Bin mass into radius shells
-    r_min, r_max = np.min(wind_radius), np.max(wind_radius)
-    r_bins = np.logspace(np.log10(r_min), np.log10(r_max), 100)
-    dr = np.diff(r_bins)
-    r_centers = 0.5 * (r_bins[:-1] + r_bins[1:])
-
-    mass_hist, _ = np.histogram(wind_radius, bins=r_bins, weights=dm)
-
-    #Compute density
-    shell_volumes = 4 * np.pi * r_centers**2 * dr
-    rho_r = mass_hist / shell_volumes  # [g/cm^3]
-    
-
-constantwind = np.full(len(vars.time), 3500)
-constantmdot = np.full(len(vars.time), 5)
-constantrad = np.full(len(vars.time), 15)
-
 
 v_wind = compute_vwind_vink(vars.mass, vars.radius, vars.gamma, vars.temp)[1]
-wind_density_profile(vars.time, constantrad, constantwind, constantmdot)
-#plotting(vars.time_myr, v_wind_vink, vars.mdot, vars.radius, vars.initialmass)
-#metal_plotting(vars.time_myr, vars.H_massfrac, vars.He_massfrac, vars.metallicity, vars.initialmass)
 
